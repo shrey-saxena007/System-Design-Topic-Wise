@@ -468,3 +468,491 @@ Retries are basically:
 
 That balance is the heart of retry design in distributed systems.
 
+---
+---
+---
+---
+---
+---
+---
+---
+---
+---
+---
+---
+---
+---
+---
+# Retries in payment using idempotency
+
+Let’s walk through a realistic payment flow with idempotency keys step-by-step.
+
+This is one of the most important distributed systems patterns in fintech.
+
+We’ll model something similar to how Stripe or modern payment gateways behave internally.
+
+---
+
+# Problem we are solving
+
+Suppose user clicks:
+
+```text id="1gqjlwm"
+Pay ₹1000
+```
+
+Client sends request.
+
+But:
+
+* network timeout happens
+* response lost
+* mobile app retries
+* user double-clicks button
+
+Without protection:
+
+```text id="q7ujd0"
+money deducted twice
+```
+
+Idempotency keys prevent this.
+
+---
+
+# High-level idea
+
+Every logical payment attempt gets a unique key.
+
+Example:
+
+```text id="g91cll"
+idempotency_key = "pay_8f92ab"
+```
+
+Server guarantees:
+
+> Same key → same logical operation → never execute twice.
+
+---
+
+# Full payment flow
+
+---
+
+# Step 1: User clicks Pay
+
+Frontend/app generates unique key.
+
+Example:
+
+```text id="r3g2pn"
+pay_8f92ab
+```
+
+Usually:
+
+* UUID
+* random token
+* globally unique
+
+---
+
+# Step 2: Client sends payment request
+
+```http id="f61v09"
+POST /payments
+
+Headers:
+Idempotency-Key: pay_8f92ab
+
+Body:
+{
+  "amount": 1000,
+  "currency": "INR",
+  "user_id": 42
+}
+```
+
+---
+
+# Step 3: Payment service receives request
+
+Now server checks:
+
+```text id="eg2mgh"
+Have I seen this idempotency key before?
+```
+
+Typically database table:
+
+| idempotency_key | status | response |
+| --------------- | ------ | -------- |
+| pay_8f92ab      | ?      | ?        |
+
+---
+
+# CASE 1 — Key not found (first request)
+
+Server inserts initial record:
+
+| idempotency_key | status     |
+| --------------- | ---------- |
+| pay_8f92ab      | PROCESSING |
+
+This is IMPORTANT.
+
+Why?
+
+Because concurrent retries may arrive immediately.
+
+---
+
+# Step 4: Server starts actual payment
+
+Flow may be:
+
+```text id="8m20s9"
+Payment Service
+    ↓
+Bank API
+    ↓
+Card Network
+    ↓
+Bank
+```
+
+Money gets charged.
+
+---
+
+# Step 5: Payment succeeds
+
+Server stores final result:
+
+| idempotency_key | status  | response       |
+| --------------- | ------- | -------------- |
+| pay_8f92ab      | SUCCESS | payment_id=123 |
+
+Now server returns:
+
+```json id="nkl0of"
+{
+  "payment_id": 123,
+  "status": "SUCCESS"
+}
+```
+
+Done.
+
+---
+
+# Now comes the important part
+
+Suppose response never reaches client.
+
+---
+
+# Step 6: Client retries
+
+Because timeout happened.
+
+Client sends SAME key:
+
+```http id="k55jlwm"
+POST /payments
+
+Idempotency-Key: pay_8f92ab
+```
+
+---
+
+# Step 7: Server checks key again
+
+Now DB contains:
+
+| idempotency_key | status  | response       |
+| --------------- | ------- | -------------- |
+| pay_8f92ab      | SUCCESS | payment_id=123 |
+
+So server DOES NOT charge again.
+
+Instead:
+
+```text id="hvv3kc"
+Return previously stored response
+```
+
+Client gets:
+
+```json id="2qj7r7"
+{
+  "payment_id": 123,
+  "status": "SUCCESS"
+}
+```
+
+No duplicate deduction.
+
+---
+
+# Core idea
+
+The key represents:
+
+```text id="3o3m6z"
+logical operation
+NOT
+individual HTTP request
+```
+
+Many retries.
+One actual effect.
+
+---
+
+# Important concurrency problem
+
+Suppose retries happen VERY quickly.
+
+Example:
+
+```text id="78v5k8"
+Request A arrives
+Request B arrives 5ms later
+```
+
+Both check DB simultaneously.
+
+Without proper locking:
+
+```text id="ng0uwl"
+both think key absent
+both charge money
+```
+
+Disaster.
+
+---
+
+# How systems solve this
+
+Usually with:
+
+* unique DB constraint
+* transactions
+* distributed locks
+
+---
+
+# Typical DB design
+
+Table:
+
+```sql id="7mbm4l"
+CREATE TABLE idempotency (
+    idempotency_key TEXT PRIMARY KEY,
+    status TEXT,
+    response JSONB
+);
+```
+
+Now duplicate insert fails automatically.
+
+---
+
+# Safe processing flow
+
+Pseudo code:
+
+```python id="0bqzye"
+try:
+    INSERT idempotency_key
+
+except duplicate_key:
+    return existing_response
+```
+
+This is atomic.
+
+Very important.
+
+---
+
+# Another tricky case:
+
+# Request crashes mid-processing
+
+Suppose:
+
+```text id="l4g1th"
+PROCESSING
+```
+
+was stored.
+
+Then service crashes before completion.
+
+Now retry arrives.
+
+Question:
+
+```text id="0uhjlwm"
+Should we retry?
+Or payment already happened?
+```
+
+This becomes complicated.
+
+---
+
+# Real systems use state machines
+
+Statuses like:
+
+| Status     | Meaning         |
+| ---------- | --------------- |
+| PROCESSING | in progress     |
+| SUCCESS    | completed       |
+| FAILED     | safe failure    |
+| UNKNOWN    | uncertain state |
+
+---
+
+# External payment gateway problem
+
+Hardest scenario:
+
+```text id="93t2y0"
+Our server → Bank API
+```
+
+Suppose:
+
+* bank charged card
+* our server crashed before saving SUCCESS
+
+Now retry comes.
+
+We genuinely don't know:
+
+* payment happened?
+* or not?
+
+---
+
+# How real gateways solve this
+
+Usually by:
+
+* querying gateway using transaction ID
+* reconciliation jobs
+* webhook callbacks
+* ledger systems
+
+Example:
+
+```text id="wjlwm2"
+"Check transaction status"
+```
+
+before retrying actual charge.
+
+---
+
+# Idempotency key expiration
+
+Systems don't store keys forever.
+
+Typical expiry:
+
+* 24 hours
+* 48 hours
+* 7 days
+
+After expiry:
+
+* same key may behave as new request
+
+---
+
+# Important distinction
+
+Idempotency keys do NOT magically prevent duplicates everywhere.
+
+They only work if:
+
+* all retries use same key
+* server stores state correctly
+* downstream systems cooperate
+
+---
+
+# Real architecture
+
+A realistic flow:
+
+```text id="lrfd9u"
+Mobile App
+   ↓
+API Gateway
+   ↓
+Payment Service
+   ↓
+Idempotency Store (Redis/DB)
+   ↓
+Bank Gateway
+```
+
+Sometimes Redis used for:
+
+* fast lookup
+* distributed locks
+
+DB used for:
+
+* durable storage
+
+---
+
+# Why payment systems love this approach
+
+Because it handles:
+
+* retries
+* double clicks
+* network failures
+* mobile reconnects
+* client crashes
+* gateway timeouts
+
+without duplicate charges.
+
+---
+
+# Very important insight
+
+Idempotency does NOT mean:
+
+```text id="5r6ct0"
+request executed once
+```
+
+It means:
+
+```text id="1k7vpl"
+side effects happen once
+```
+
+The server may receive:
+
+* 2 requests
+* 10 retries
+* duplicated packets
+
+But:
+
+* only one charge occurs
+
+That’s the real goal.
+
